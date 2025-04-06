@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server"
+import { supabase, ImagePrompt } from "@/lib/supabase"
+import ffmpeg from "fluent-ffmpeg"
 import { exec } from "child_process"
 import { promisify } from "util"
 import fs from "fs"
@@ -8,44 +10,73 @@ const execAsync = promisify(exec)
 
 export async function POST(req: Request) {
   try {
-    // Create a temporary directory for processing
-    const tempDir = path.join(process.cwd(), "temp")
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir)
-    }
+    const { projectId } = await req.json()
 
-    // Generate FFmpeg command to combine videos and audio
-    const ffmpegCommand = `
-      ffmpeg -y \
-      -i video_1.mp4 -i audio_1.mp3 \
-      -i video_2.mp4 -i audio_2.mp3 \
-      -i video_3.mp4 -i audio_3.mp3 \
-      -i video_4.mp4 -i audio_4.mp3 \
-      -i video_5.mp4 -i audio_5.mp3 \
-      -i video_6.mp4 -i audio_6.mp3 \
-      -i video_7.mp4 -i audio_7.mp3 \
-      -filter_complex "[0:v][0:a][1:v][1:a][2:v][2:a][3:v][3:a][4:v][4:a][5:v][5:a][6:v][6:a]concat=n=7:v=1:a=1[v][a]" \
-      -map "[v]" -map "[a]" \
-      -c:v libx264 -c:a aac \
-      final_output.mp4
-    `.trim()
+    // Get all animated frames for this project
+    const { data: frames, error: framesError } = await supabase
+      .from("image_prompts")
+      .select("*")
+      .eq("project_id", projectId)
+      .order("prompt_index")
 
-    // Execute FFmpeg command
-    await execAsync(ffmpegCommand, { cwd: tempDir })
+    if (framesError) throw framesError
+    if (!frames?.length) throw new Error("No frames found")
 
-    // Read the final video file
-    const videoPath = path.join(tempDir, "final_output.mp4")
-    const videoBuffer = fs.readFileSync(videoPath)
-    const base64Video = videoBuffer.toString("base64")
+    // Create temp directory for processing
+    const tempDir = path.join(process.cwd(), "public", "temp", projectId)
+    await fs.promises.mkdir(tempDir, { recursive: true })
 
-    // Clean up temporary files
-    fs.rmSync(tempDir, { recursive: true, force: true })
+    // Download all frame videos
+    const frameFiles = await Promise.all(
+      frames.map(async (frame: ImagePrompt, index: number) => {
+        if (!frame.video_url) throw new Error(`No video URL for frame ${index}`)
+        const response = await fetch(`${process.env.NEXT_PUBLIC_SITE_URL}${frame.video_url}`)
+        const buffer = await response.arrayBuffer()
+        const fileName = path.join(tempDir, `frame_${index}.mp4`)
+        await fs.promises.writeFile(fileName, Buffer.from(buffer))
+        return fileName
+      })
+    )
 
-    return NextResponse.json({ video: base64Video })
-  } catch (error) {
+    // Create file list for concatenation
+    const listFile = path.join(tempDir, "list.txt")
+    const fileList = frameFiles.map((file: string) => `file '${file}'`).join("\n")
+    await fs.promises.writeFile(listFile, fileList)
+
+    // Concatenate videos
+    const outputFile = path.join(process.cwd(), "public", "videos", `${projectId}.mp4`)
+    await execAsync(`ffmpeg -f concat -safe 0 -i ${listFile} -c copy ${outputFile}`)
+
+    // Add background music
+    const musicFile = path.join(process.cwd(), "public", "audio", "background.mp3")
+    const finalOutput = path.join(process.cwd(), "public", "videos", `${projectId}_final.mp4`)
+    await execAsync(
+      `ffmpeg -i ${outputFile} -i ${musicFile} -filter_complex "[1:a]volume=0.3[a1];[0:a][a1]amix=inputs=2:duration=longest" -c:v copy ${finalOutput}`
+    )
+
+    // Clean up temp files
+    await fs.promises.rm(tempDir, { recursive: true, force: true })
+    await fs.promises.unlink(outputFile)
+
+    // Update project status
+    const { error: updateError } = await supabase
+      .from("video_projects")
+      .update({
+        status: "completed",
+        video_url: `/videos/${projectId}_final.mp4`,
+      })
+      .eq("id", projectId)
+
+    if (updateError) throw updateError
+
+    return NextResponse.json({
+      success: true,
+      videoUrl: `/videos/${projectId}_final.mp4`,
+    })
+  } catch (error: any) {
     console.error("Error rendering video:", error)
     return NextResponse.json(
-      { error: "Failed to render video" },
+      { error: "Failed to render video", details: error.message },
       { status: 500 }
     )
   }
